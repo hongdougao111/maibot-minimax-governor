@@ -1,7 +1,7 @@
 {
   "manifest_version": 2,
   "id": "github.hongdougao111.minimax-governor",
-  "version": "1.0.0",
+  "version": "1.2.0",
   "name": "MiniMax 开支管家",
   "description": "监测 MiniMax 套餐余量与回复消耗，分群独立预算，超限自动降低发言频率，支持管理员专属开关与激进/保守/均衡三档策略",
   "author": {
