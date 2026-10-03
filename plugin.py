@@ -4,10 +4,11 @@ import os
 import time
 from collections import defaultdict, deque
 from datetime import datetime, timedelta
+from typing import Dict
 
 import aiohttp
 
-from maibot_sdk import Command, EventHandler, MaiBotPlugin
+from maibot_sdk import EventHandler, Field, MaiBotPlugin, PluginConfigBase
 from maibot_sdk.types import EventType
 
 ENDPOINTS = [
@@ -40,7 +41,73 @@ def _find_numbers(obj, prefix=""):
     return found
 
 
+# ---------- WebUI 配置模型 ----------
+class GovernorSection(PluginConfigBase):
+    __ui_label__ = "开支管家设置"
+
+    api_key: str = Field(
+        default="",
+        description="MiniMax API 密钥（Token Plan 填 sk-cp- 开头的套餐 Key）",
+        json_schema_extra={"label": "API 密钥", "placeholder": "sk-..."},
+    )
+    group_id: str = Field(
+        default="",
+        description="MiniMax 账户的 GroupId（找不到可填 0，仅影响余量显示）",
+        json_schema_extra={"label": "GroupId", "placeholder": "1234567890"},
+    )
+    check_interval_minutes: int = Field(
+        default=30,
+        ge=5,
+        description="每多少分钟查询一次套餐余量",
+        json_schema_extra={"label": "余量查询间隔（分钟）"},
+    )
+    default_reply_budget_per_hour: int = Field(
+        default=40,
+        ge=1,
+        description="默认每小时回复软上限（未单独设预算的群使用此值）",
+        json_schema_extra={"label": "默认每小时回复预算"},
+    )
+    group_budgets: Dict[str, int] = Field(
+        default_factory=dict,
+        description='分群独立预算，TOML 写法：group_budgets = { "群号" = 每小时上限 }',
+        json_schema_extra={"label": "分群独立预算（高级）"},
+    )
+    hard_multiplier: float = Field(
+        default=1.5,
+        description="硬上限 = 软上限 × 此倍数",
+        json_schema_extra={"label": "硬上限倍数"},
+    )
+    strategy: str = Field(
+        default="balanced",
+        description="初始策略：conservative（保守）/ balanced（均衡）/ aggressive（激进）",
+        json_schema_extra={"label": "策略", "hint": "conservative 更省，aggressive 更活跃"},
+    )
+    low_percent: int = Field(
+        default=20,
+        description="套餐余量百分比低于此值时强制限流并提醒",
+        json_schema_extra={"label": "余量告急阈值（%）"},
+    )
+    notify_stream_id: str = Field(
+        default="",
+        description="告急提醒与每日日报推送目标，如 qq:管理员QQ:private，留空只记日志",
+        json_schema_extra={"label": "推送目标", "placeholder": "qq:10000:private"},
+    )
+    daily_report_hour: int = Field(
+        default=21,
+        ge=0,
+        le=23,
+        description="每天几点推送消费日报（0-23）",
+        json_schema_extra={"label": "日报推送时刻（点）"},
+    )
+
+
+class GovernorConfig(PluginConfigBase):
+    minimax_governor: GovernorSection = Field(default_factory=GovernorSection)
+
+
 class MiniMaxGovernor(MaiBotPlugin):
+    config_model = GovernorConfig
+
     def __init__(self):
         super().__init__()
         self.replies = deque()              # (ts, chat_id)
@@ -49,11 +116,11 @@ class MiniMaxGovernor(MaiBotPlugin):
         self.usage_history = []
         self.last_percent = None
         self.last_alert_day = None
+        self.last_report_day = None
         self.surveyed = False
         self.tasks = []
 
         self.strategy = "balanced"
-        self.free_until = None              # 管理员开了"随便聊"后的截止时间
         self.state_file = None
 
     # ---------- 生命周期 ----------
@@ -82,12 +149,22 @@ class MiniMaxGovernor(MaiBotPlugin):
         self.applied.clear()
 
     async def on_config_update(self, scope, config_data, version):
-        pass
+        self.ctx.logger.info("管家: 配置已更新（version=%s），新设置即刻生效", version)
 
-    # ---------- 配置与状态 ----------
-    def _cfg(self, key, default):
+    # ---------- 配置读取 ----------
+    def _c(self, key, default=None):
+        """优先从强类型配置模型取值，兼容旧版字典式配置"""
+        try:
+            section = getattr(self.config, "minimax_governor", None)
+            if section is not None and hasattr(section, key):
+                val = getattr(section, key)
+                if val is not None:
+                    return val
+        except Exception:
+            pass
         cfg = self.config.get("minimax_governor", {}) if isinstance(self.config, dict) else {}
-        return cfg.get(key, default)
+        val = cfg.get(key)
+        return default if val is None else val
 
     def _load_state(self):
         if not self.state_file or not os.path.exists(self.state_file):
@@ -98,8 +175,6 @@ class MiniMaxGovernor(MaiBotPlugin):
             self.strategy = state.get("strategy", "balanced")
             if self.strategy not in STRATEGIES:
                 self.strategy = "balanced"
-            fu = state.get("free_until")
-            self.free_until = datetime.fromisoformat(fu) if fu else None
         except Exception as e:
             self.ctx.logger.warning("管家状态读取失败: %s", e)
 
@@ -108,37 +183,9 @@ class MiniMaxGovernor(MaiBotPlugin):
             return
         try:
             with open(self.state_file, "w", encoding="utf-8") as f:
-                json.dump({"strategy": self.strategy,
-                           "free_until": self.free_until.isoformat() if self.free_until else None}, f)
+                json.dump({"strategy": self.strategy}, f)
         except Exception as e:
             self.ctx.logger.warning("管家状态保存失败: %s", e)
-
-    def _is_free_now(self):
-        if self.free_until and datetime.now() < self.free_until:
-            return True
-        if self.free_until and datetime.now() >= self.free_until:
-            self.free_until = None
-            self._save_state()
-        return False
-
-    # ---------- 管理员鉴权（fail-closed：识别失败一律拒绝） ----------
-    def _admin_check(self, kwargs):
-        admin = str(self._cfg("admin_qq", "") or "")
-        if not admin:
-            self.ctx.logger.warning("管家: 未配置 admin_qq，管理员命令全部拒绝")
-            return False
-        msg = kwargs.get("message")
-        uid = None
-        if isinstance(msg, dict):
-            ui = msg.get("user_info")
-            if isinstance(ui, dict) and ui.get("user_id") is not None:
-                uid = ui.get("user_id")   # 顶层发送者字段，不递归搜索，避免取到引用/转发里别人的 ID
-            elif msg.get("sender_id") is not None:
-                uid = msg.get("sender_id")
-        if uid is None:
-            self.ctx.logger.info("管家: 未能识别命令发送者，按非管理员拒绝")
-            return False
-        return str(uid) == admin
 
     # ---------- 消息处理 ----------
     def _extract_chat_id(self, message):
@@ -166,13 +213,16 @@ class MiniMaxGovernor(MaiBotPlugin):
 
     def _budget_for(self, chat_id):
         """分群独立预算：chat_id 里包含群号则用群号匹配，否则用默认"""
-        base = float(self._cfg("default_reply_budget_per_hour", 40))
-        budgets = self._cfg("group_budgets", {})
+        base = float(self._c("default_reply_budget_per_hour", 40) or 40)
+        budgets = self._c("group_budgets", {}) or {}
         mult = STRATEGIES.get(self.strategy, STRATEGIES["balanced"])["budget_mult"]
         if isinstance(budgets, dict) and isinstance(chat_id, str):
             for gid, val in budgets.items():
                 if gid and str(gid) in chat_id:
-                    base = float(val)
+                    try:
+                        base = float(val)
+                    except (TypeError, ValueError):
+                        pass
                     break
         return base * mult
 
@@ -196,8 +246,8 @@ class MiniMaxGovernor(MaiBotPlugin):
 
     # ---------- 套餐查询 ----------
     async def fetch_balance(self):
-        key = self._cfg("api_key", "")
-        gid = self._cfg("group_id", "")
+        key = str(self._c("api_key", "") or "")
+        gid = str(self._c("group_id", "") or "")
         if not key or not gid:
             return None, "未配置 api_key / group_id"
         headers = {"Authorization": f"Bearer {key}"}
@@ -262,7 +312,7 @@ class MiniMaxGovernor(MaiBotPlugin):
             self.ctx.logger.warning("管家 set_adjust 失败 %s: %s", cid, e)
 
     async def _alert(self, text):
-        sid = self._cfg("notify_stream_id", "")
+        sid = str(self._c("notify_stream_id", "") or "")
         if not sid:
             return
         try:
@@ -272,39 +322,61 @@ class MiniMaxGovernor(MaiBotPlugin):
 
     async def _gov_loop(self):
         await asyncio.sleep(60)
+        last_daily_check = None
         while True:
             try:
                 self._trim()
-                if self._is_free_now():
-                    for cid in list(self.chat_ids):
-                        await self._apply(cid, 0.0, "省流关生效中")
-                else:
-                    hard_mult = float(self._cfg("hard_multiplier", 1.5))
-                    preset = STRATEGIES.get(self.strategy, STRATEGIES["balanced"])
-                    recover_ratio = preset["recover"]
-                    throttle = preset["throttle"]
-                    counts = defaultdict(int)
-                    for _, cid in self.replies:
-                        counts[cid] += 1
-                    percent_low = (self.last_percent is not None
-                                   and self.last_percent < float(self._cfg("low_percent", 20)))
-                    for cid in list(self.chat_ids):
-                        budget = self._budget_for(cid)
-                        hard = budget * hard_mult
-                        n = counts.get(cid, 0)
-                        if percent_low:
-                            await self._apply(cid, throttle, f"套餐余量仅 {self.last_percent}%")
-                        elif n >= hard:
-                            await self._apply(cid, throttle, f"回复 {n} 条 触及硬上限（预算{budget:.0f}）")
-                        elif n >= budget:
-                            ratio = (n - budget) / max(1.0, hard - budget)
-                            await self._apply(cid, throttle * (0.5 + 0.5 * ratio),
-                                              f"回复 {n} 条 超预算{budget:.0f}")
-                        elif n < budget * recover_ratio and self.applied.get(cid, 0) != 0:
-                            await self._apply(cid, 0.0, f"回复 {n} 条 回落至预算内")
+                hard_mult = float(self._c("hard_multiplier", 1.5) or 1.5)
+                preset = STRATEGIES.get(self.strategy, STRATEGIES["balanced"])
+                recover_ratio = preset["recover"]
+                throttle = preset["throttle"]
+                counts = defaultdict(int)
+                for _, cid in self.replies:
+                    counts[cid] += 1
+                low_pct = float(self._c("low_percent", 20) or 20)
+                percent_low = self.last_percent is not None and self.last_percent < low_pct
+                for cid in list(self.chat_ids):
+                    budget = self._budget_for(cid)
+                    hard = budget * hard_mult
+                    n = counts.get(cid, 0)
+                    if percent_low:
+                        await self._apply(cid, throttle, f"套餐余量仅 {self.last_percent}%")
+                    elif n >= hard:
+                        await self._apply(cid, throttle, f"回复 {n} 条 触及硬上限（预算{budget:.0f}）")
+                    elif n >= budget:
+                        ratio = (n - budget) / max(1.0, hard - budget)
+                        await self._apply(cid, throttle * (0.5 + 0.5 * ratio),
+                                          f"回复 {n} 条 超预算{budget:.0f}")
+                    elif n < budget * recover_ratio and self.applied.get(cid, 0) != 0:
+                        await self._apply(cid, 0.0, f"回复 {n} 条 回落至预算内")
+
+                # 每日消费日报
+                now = datetime.now()
+                report_hour = int(self._c("daily_report_hour", 21) or 21)
+                today = now.strftime("%Y-%m-%d")
+                if now.hour == report_hour and self.last_report_day != today:
+                    if last_daily_check != today:
+                        last_daily_check = today
+                        self.last_report_day = today
+                        self._trim()
+                        await self._alert(self._daily_report(len(self.replies)))
             except Exception as e:
                 self.ctx.logger.warning("管家调速循环异常: %s", e)
             await asyncio.sleep(60)
+
+    def _daily_report(self, replies_last_hour):
+        lines = ["📊 MiniMax 消费日报"]
+        if self.last_percent is not None:
+            lines.append(f"· 套餐余量：{self.last_percent}%")
+        est = self._burn_estimate()
+        if est:
+            k, rate, eta = est
+            eta_txt = f"，按此速度约能用 {eta:.1f} 天" if eta else ""
+            lines.append(f"· 消耗速度：{k} 每小时约 {rate:.1f}{eta_txt}")
+        lines.append(f"· 最近 1 小时回复：{replies_last_hour} 条")
+        lines.append(f"· 当前策略：{self.strategy}")
+        lines.append("· 小提示：改配置请到 WebUI 插件设置页～")
+        return "\n".join(lines)
 
     async def _api_loop(self):
         await asyncio.sleep(45)
@@ -319,89 +391,16 @@ class MiniMaxGovernor(MaiBotPlugin):
                         eta_txt = f"，按此速度约能用 {eta:.1f} 天" if eta else ""
                         self.ctx.logger.info("管家: %s 每小时消耗 %.1f%s", k, rate, eta_txt)
                     today = time.strftime("%Y-%m-%d")
+                    low_pct = float(self._c("low_percent", 20) or 20)
                     for k, v in nums.items():
                         if ("percent" in k.lower() and isinstance(v, (int, float))
-                                and v < float(self._cfg("low_percent", 20))
-                                and self.last_alert_day != today):
+                                and v < low_pct and self.last_alert_day != today):
                             self.last_alert_day = today
                             await self._alert(f"⚠️ 套餐余量仅剩 {v}%，建议省流或续费！")
             except Exception as e:
                 self.ctx.logger.warning("管家查询循环异常: %s", e)
             try:
-                interval = max(5, int(self._cfg("check_interval_minutes", 30)))
+                interval = max(5, int(self._c("check_interval_minutes", 30) or 30))
             except Exception:
                 interval = 30
             await asyncio.sleep(interval * 60)
-
-    # ---------- 命令 ----------
-    @Command("balance", pattern=r"^/余额$|^/balance$")
-    async def cmd_balance(self, **kwargs):
-        data, err = await self.fetch_balance()
-        if err:
-            await self.ctx.send.text("MiniMax 查询失败：" + err, kwargs["stream_id"])
-            return True, err, 2
-        nums = self._record(data)
-        parts = ["【MiniMax 开支管家】", self._fmt(nums)]
-        if self.last_percent is not None:
-            parts.append(f"套餐余量：{self.last_percent}%")
-        est = self._burn_estimate()
-        if est:
-            k, rate, eta = est
-            eta_txt = f"，预计还能用 {eta:.1f} 天" if eta else ""
-            parts.append(f"消耗速度：{k} 每小时约 {rate:.1f}{eta_txt}")
-        parts.append(f"本小时回复：{len(self.replies)} 条")
-        parts.append(f"当前策略：{self.strategy}" + ("｜省流关生效中" if self._is_free_now() else ""))
-        # 原始返回含账户信息，仅管理员可见，避免对全群泄露
-        if self._admin_check(kwargs):
-            parts.append("原始返回：" + json.dumps(data, ensure_ascii=False)[:300])
-        await self.ctx.send.text("\n".join(parts), kwargs["stream_id"])
-        return True, "ok", 2
-
-    @Command("saveliu_off", pattern=r"^/省流关$")
-    async def cmd_saveliu_off(self, **kwargs):
-        if not self._admin_check(kwargs):
-            await self.ctx.send.text("哼，只有管理员能动这个开关哦～", kwargs["stream_id"])
-            return True, "denied", 2
-        self.free_until = datetime.now() + timedelta(hours=12)
-        self._save_state()
-        for cid in list(self.chat_ids):
-            await self._apply(cid, 0.0, "省流关：管理员解锁随便聊")
-        await self.ctx.send.text("好～省流模式关闭 12 小时，我放开聊！到时自动恢复哦～", kwargs["stream_id"])
-        return True, "ok", 2
-
-    @Command("saveliu_on", pattern=r"^/省流开$")
-    async def cmd_saveliu_on(self, **kwargs):
-        if not self._admin_check(kwargs):
-            await self.ctx.send.text("哼，只有管理员能动这个开关哦～", kwargs["stream_id"])
-            return True, "denied", 2
-        self.free_until = None
-        self._save_state()
-        await self.ctx.send.text("收到，省流模式恢复运行，我会看好钱包的～", kwargs["stream_id"])
-        return True, "ok", 2
-
-    @Command("strategy_c", pattern=r"^/策略保守$")
-    async def cmd_strategy_c(self, **kwargs):
-        return await self._set_strategy("conservative", "保守", kwargs)
-
-    @Command("strategy_b", pattern=r"^/策略均衡$")
-    async def cmd_strategy_b(self, **kwargs):
-        return await self._set_strategy("balanced", "均衡", kwargs)
-
-    @Command("strategy_a", pattern=r"^/策略激进$")
-    async def cmd_strategy_a(self, **kwargs):
-        return await self._set_strategy("aggressive", "激进", kwargs)
-
-    async def _set_strategy(self, key, label, kwargs):
-        if not self._admin_check(kwargs):
-            await self.ctx.send.text("哼，只有管理员能动这个开关哦～", kwargs["stream_id"])
-            return True, "denied", 2
-        self.strategy = key
-        self._save_state()
-        await self.ctx.send.text(f"已切换到{label}策略：预算×{STRATEGIES[key]['budget_mult']}，"
-                                 f"限流深度 {STRATEGIES[key]['throttle']}，即刻生效～",
-                                 kwargs["stream_id"])
-        return True, "ok", 2
-
-
-def create_plugin():
-    return MiniMaxGovernor()
