@@ -75,10 +75,10 @@ class GovernorSection(PluginConfigBase):
         description="默认每小时回复软上限。未单独设预算的群使用此值。参考：每次回复约消耗 1~3 万 token",
         json_schema_extra={"label": "默认每小时回复预算"},
     )
-    group_budgets: Dict[str, int] = Field(
-        default_factory=dict,
-        description='分群独立预算。TOML 写法：group_budgets = { "群号" = 每小时回复上限 }',
-        json_schema_extra={"label": "分群独立预算（高级）"},
+    group_budgets: str = Field(
+        default="",
+        description="分群独立预算（高级）。格式：群号=每小时回复上限，多个用英文逗号分隔，如 123456=60,789=20。留空则所有群用默认预算",
+        json_schema_extra={"label": "分群独立预算（高级）", "placeholder": "123456=60,789012=20"},
     )
     hard_multiplier: float = Field(
         default=1.5,
@@ -236,17 +236,27 @@ class MiniMaxGovernor(MaiBotPlugin):
             self.replies.popleft()
 
     def _budget_for(self, chat_id):
-        """分群独立预算：chat_id 里包含群号则用群号匹配，否则用默认"""
+        """分群独立预算：chat_id 里包含群号则用群号匹配，否则用默认。
+        支持两种配置写法：字符串 "群号=上限,群号=上限" 或字典 {群号: 上限}"""
         base = float(self._c("default_reply_budget_per_hour", 40) or 40)
-        budgets = self._c("group_budgets", {}) or {}
+        raw = self._c("group_budgets", "") or ""
         mult = STRATEGIES.get(self.strategy, STRATEGIES["balanced"])["budget_mult"]
-        if isinstance(budgets, dict) and isinstance(chat_id, str):
-            for gid, val in budgets.items():
-                if gid and str(gid) in chat_id:
+        budgets = {}
+        if isinstance(raw, dict):
+            budgets = {str(k): v for k, v in raw.items()}
+        elif isinstance(raw, str) and raw.strip():
+            for part in raw.split(","):
+                part = part.strip()
+                if "=" in part:
+                    gid, _, val = part.partition("=")
                     try:
-                        base = float(val)
-                    except (TypeError, ValueError):
-                        pass
+                        budgets[gid.strip()] = float(val.strip())
+                    except ValueError:
+                        self.ctx.logger.warning("管家: 分群预算格式错误，忽略片段 %r", part)
+        if budgets and isinstance(chat_id, str):
+            for gid, val in budgets.items():
+                if gid and gid in chat_id:
+                    base = float(val)
                     break
         return base * mult
 
