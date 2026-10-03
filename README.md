@@ -29,14 +29,28 @@
 ```bash
 cd /path/to/MaiBot/plugins
 git clone https://github.com/hongdougao111/maibot-minimax-governor.git minimax-governor
+cd minimax-governor
 ```
 
-2. 编辑 `minimax-governor/config.toml`，填写 `api_key` 与 `group_id`（Token Plan 用户填 `sk-sp-` 开头的套餐专属 Key）；
+2. 从模板生成配置并填写（仓库不直接提供 config.toml，避免 git pull 覆盖你已填好的密钥）：
+
+```bash
+cp config.example.toml config.toml
+# 然后编辑 config.toml，填入 api_key 与 group_id
+# （Token Plan 用户填 sk-sp- 开头的套餐专属 Key）
+```
+
 3. 重启 MaiBot，在 WebUI「插件管理」中启用本插件。
+
+## 安全说明
+
+- 管理员鉴权采用 **fail-closed** 策略：无法识别命令发送者时一律拒绝，绝不放行；发送者 ID 只取消息顶层 `user_info.user_id`，不会误取引用/转发内容中他人的 ID。
+- 插件停用或卸载时，会自动归还所有已设置的发言频率调整值（`set_adjust` 归零），机器人不会带着限流状态"带病运行"。
+- `/余额` 的原始接口返回包含账户信息，仅对管理员可见。
 
 ## 配置说明
 
-见 [`config.toml`](./config.toml)，每个字段都有注释。核心字段：
+见 [`config.example.toml`](./config.example.toml)，每个字段都有注释。核心字段：
 
 | 字段 | 说明 |
 | --- | --- |

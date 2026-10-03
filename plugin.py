@@ -53,7 +53,7 @@ class MiniMaxGovernor(MaiBotPlugin):
         self.tasks = []
 
         self.strategy = "balanced"
-        self.free_until = None              # 老爹开了"随便聊"后的截止时间
+        self.free_until = None              # 管理员开了"随便聊"后的截止时间
         self.state_file = None
 
     # ---------- 生命周期 ----------
@@ -73,6 +73,13 @@ class MiniMaxGovernor(MaiBotPlugin):
     async def on_unload(self):
         for t in self.tasks:
             t.cancel()
+        # 归还所有频率调整，避免插件停用后机器人仍带着限流跑
+        for cid in list(self.applied.keys()):
+            try:
+                await self.ctx.frequency.set_adjust(cid, 0.0)
+            except Exception as e:
+                self.ctx.logger.warning("管家卸载归还调整失败 %s: %s", cid, e)
+        self.applied.clear()
 
     async def on_config_update(self, scope, config_data, version):
         pass
@@ -110,35 +117,28 @@ class MiniMaxGovernor(MaiBotPlugin):
         if self.free_until and datetime.now() < self.free_until:
             return True
         if self.free_until and datetime.now() >= self.free_until:
-            self.free_until = None   # 到期自动恢复
+            self.free_until = None
             self._save_state()
         return False
 
+    # ---------- 管理员鉴权（fail-closed：识别失败一律拒绝） ----------
     def _admin_check(self, kwargs):
-        """校验命令发送者是不是管理员；无法识别时放行并记录日志"""
-        admin = str(self._cfg("admin_qq", ""))
-        uid = self._find_user_id(kwargs.get("message"))
+        admin = str(self._cfg("admin_qq", "") or "")
+        if not admin:
+            self.ctx.logger.warning("管家: 未配置 admin_qq，管理员命令全部拒绝")
+            return False
+        msg = kwargs.get("message")
+        uid = None
+        if isinstance(msg, dict):
+            ui = msg.get("user_info")
+            if isinstance(ui, dict) and ui.get("user_id") is not None:
+                uid = ui.get("user_id")   # 顶层发送者字段，不递归搜索，避免取到引用/转发里别人的 ID
+            elif msg.get("sender_id") is not None:
+                uid = msg.get("sender_id")
         if uid is None:
-            self.ctx.logger.info("管家: 无法识别命令发送者，默认放行（建议核对日志）")
-            return True
-        if str(uid) == admin:
-            return True
-        return False
-
-    def _find_user_id(self, obj):
-        if isinstance(obj, dict):
-            for k, v in obj.items():
-                if k == "user_id" and v is not None:
-                    return v
-                r = self._find_user_id(v)
-                if r is not None:
-                    return r
-        elif isinstance(obj, list):
-            for item in obj:
-                r = self._find_user_id(item)
-                if r is not None:
-                    return r
-        return None
+            self.ctx.logger.info("管家: 未能识别命令发送者，按非管理员拒绝")
+            return False
+        return str(uid) == admin
 
     # ---------- 消息处理 ----------
     def _extract_chat_id(self, message):
@@ -250,11 +250,6 @@ class MiniMaxGovernor(MaiBotPlugin):
         return "\n".join(f"· {k} = {v}" for k, v in list(nums.items())[:10])
 
     # ---------- 调速 ----------
-    def _trim(self):
-        cutoff = time.time() - WINDOW
-        while self.replies and self.replies[0][0] < cutoff:
-            self.replies.popleft()
-
     async def _apply(self, cid, target, reason):
         if self.applied.get(cid) == target:
             return
@@ -281,7 +276,6 @@ class MiniMaxGovernor(MaiBotPlugin):
             try:
                 self._trim()
                 if self._is_free_now():
-                    # 老爹开了随便聊：全部放开
                     for cid in list(self.chat_ids):
                         await self._apply(cid, 0.0, "省流关生效中")
                 else:
@@ -308,8 +302,6 @@ class MiniMaxGovernor(MaiBotPlugin):
                                               f"回复 {n} 条 超预算{budget:.0f}")
                         elif n < budget * recover_ratio and self.applied.get(cid, 0) != 0:
                             await self._apply(cid, 0.0, f"回复 {n} 条 回落至预算内")
-                        elif self.applied.get(cid, 0) != 0:
-                            await self._apply(cid, self.applied[cid] * 0.5, "逐步恢复")
             except Exception as e:
                 self.ctx.logger.warning("管家调速循环异常: %s", e)
             await asyncio.sleep(60)
@@ -359,7 +351,9 @@ class MiniMaxGovernor(MaiBotPlugin):
             parts.append(f"消耗速度：{k} 每小时约 {rate:.1f}{eta_txt}")
         parts.append(f"本小时回复：{len(self.replies)} 条")
         parts.append(f"当前策略：{self.strategy}" + ("｜省流关生效中" if self._is_free_now() else ""))
-        parts.append("原始返回：" + json.dumps(data, ensure_ascii=False)[:300])
+        # 原始返回含账户信息，仅管理员可见，避免对全群泄露
+        if self._admin_check(kwargs):
+            parts.append("原始返回：" + json.dumps(data, ensure_ascii=False)[:300])
         await self.ctx.send.text("\n".join(parts), kwargs["stream_id"])
         return True, "ok", 2
 
@@ -371,8 +365,8 @@ class MiniMaxGovernor(MaiBotPlugin):
         self.free_until = datetime.now() + timedelta(hours=12)
         self._save_state()
         for cid in list(self.chat_ids):
-                        await self._apply(cid, 0.0, "省流关：管理员解锁随便聊")
-        await self.ctx.send.text("好～今晚省流模式关闭，我放开聊！到明早自动恢复哦～", kwargs["stream_id"])
+            await self._apply(cid, 0.0, "省流关：管理员解锁随便聊")
+        await self.ctx.send.text("好～省流模式关闭 12 小时，我放开聊！到时自动恢复哦～", kwargs["stream_id"])
         return True, "ok", 2
 
     @Command("saveliu_on", pattern=r"^/省流开$")
