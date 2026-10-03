@@ -115,6 +115,8 @@ class GovernorSection(PluginConfigBase):
 class PluginMetaSection(PluginConfigBase):
     __ui_label__ = "插件基础"
 
+    name: str = Field(default="MiniMax 开支管家", description="插件名称")
+    version: str = Field(default="1.3.1", description="插件版本号")
     config_version: str = Field(default="1.0.0", description="配置版本号（请勿修改）")
     enabled: bool = Field(default=True, description="是否启用插件")
 

@@ -26,9 +26,9 @@ check_interval_minutes = 30
 # 默认每小时回复软上限（未单独设置预算的群使用此值）
 # 参考：每次回复约消耗 1~3 万 token，请按套餐额度估算
 default_reply_budget_per_hour = 40
-# 分群独立预算：键为群号，未列出的群使用默认预算
-# group_budgets = { "123456789" = 60, "987654321" = 20 }
-group_budgets = {}
+# 分群独立预算：格式为文本，群号=每小时回复上限，多个用英文逗号分隔
+# group_budgets = "123456789=60,987654321=20"
+group_budgets = ""
 # 硬上限 = 软上限 × 此倍数
 hard_multiplier = 1.5
 
