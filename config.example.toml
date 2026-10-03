@@ -1,11 +1,22 @@
+# ============================================================
+# 本文件由 [plugin] 与 [minimax_governor] 两个配置节组成
+# [plugin] 节为 MaiBot 插件系统要求的基础信息，请勿删除
+# ============================================================
+
+[plugin]
+name = "MiniMax 开支管家"
+version = "1.2.0"
+config_version = "1.0.0"
+enabled = true
+
 [minimax_governor]
 # ---- MiniMax 账户信息（必填）----
 # 开放平台 https://platform.minimaxi.com → 套餐详情
 # Token Plan / M Plan 用户填 sk-cp- 开头的套餐订阅 Key
-# 也可以直接在 WebUI「插件管理 → 本插件 → 设置」里在线修改，无需改文件
-api_key = ""
+# 注意：密钥两端的英文双引号必须保留！
+api_key = "把这里改成你的密钥"
 # 账户基本信息页面可见的 GroupId（找不到可填 0，仅影响余量显示）
-group_id = ""
+group_id = "0"
 
 # ---- 查询间隔 ----
 # 每 N 分钟查询一次套餐余量（最小 5）

@@ -3,7 +3,7 @@ import json
 import os
 import time
 from collections import defaultdict, deque
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Dict
 
 import aiohttp
@@ -41,67 +41,86 @@ def _find_numbers(obj, prefix=""):
     return found
 
 
-# ---------- WebUI 配置模型 ----------
+# ---------- WebUI 配置模型（本节所有文字都会显示在插件设置页） ----------
 class GovernorSection(PluginConfigBase):
     __ui_label__ = "开支管家设置"
 
     api_key: str = Field(
         default="",
-        description="MiniMax API 密钥（Token Plan 填 sk-cp- 开头的套餐 Key）",
-        json_schema_extra={"label": "API 密钥", "placeholder": "sk-..."},
+        description="MiniMax API 密钥。Token Plan / M Plan 用户填 sk-cp- 开头的套餐订阅 Key",
+        json_schema_extra={
+            "label": "API 密钥",
+            "placeholder": "sk-cp-xxxxxxxx",
+            "hint": "在 MiniMax 开放平台「套餐详情」页面复制",
+        },
     )
     group_id: str = Field(
         default="",
-        description="MiniMax 账户的 GroupId（找不到可填 0，仅影响余量显示）",
-        json_schema_extra={"label": "GroupId", "placeholder": "1234567890"},
+        description="MiniMax 账户的 GroupId。找不到可填 0，仅影响余量显示",
+        json_schema_extra={
+            "label": "GroupId",
+            "placeholder": "1234567890",
+            "hint": "在 MiniMax 开放平台「基本信息」页面查看",
+        },
     )
     check_interval_minutes: int = Field(
         default=30,
         ge=5,
-        description="每多少分钟查询一次套餐余量",
+        description="每多少分钟查询一次套餐余量（最小 5）",
         json_schema_extra={"label": "余量查询间隔（分钟）"},
     )
     default_reply_budget_per_hour: int = Field(
         default=40,
         ge=1,
-        description="默认每小时回复软上限（未单独设预算的群使用此值）",
+        description="默认每小时回复软上限。未单独设预算的群使用此值。参考：每次回复约消耗 1~3 万 token",
         json_schema_extra={"label": "默认每小时回复预算"},
     )
     group_budgets: Dict[str, int] = Field(
         default_factory=dict,
-        description='分群独立预算，TOML 写法：group_budgets = { "群号" = 每小时上限 }',
+        description='分群独立预算。TOML 写法：group_budgets = { "群号" = 每小时回复上限 }',
         json_schema_extra={"label": "分群独立预算（高级）"},
     )
     hard_multiplier: float = Field(
         default=1.5,
-        description="硬上限 = 软上限 × 此倍数",
+        description="硬上限 = 软上限 × 此倍数。达到硬上限会最深度限流",
         json_schema_extra={"label": "硬上限倍数"},
     )
     strategy: str = Field(
         default="balanced",
-        description="初始策略：conservative（保守）/ balanced（均衡）/ aggressive（激进）",
-        json_schema_extra={"label": "策略", "hint": "conservative 更省，aggressive 更活跃"},
+        description="限流策略：conservative（保守，预算×0.7，省着用）/ balanced（均衡，预算×1.0）/ aggressive（激进，预算×1.5，放开聊）",
+        json_schema_extra={"label": "限流策略", "hint": "conservative / balanced / aggressive 三选一"},
     )
     low_percent: int = Field(
         default=20,
-        description="套餐余量百分比低于此值时强制限流并提醒",
+        description="套餐余量百分比低于此值时强制限流并推送提醒",
         json_schema_extra={"label": "余量告急阈值（%）"},
     )
     notify_stream_id: str = Field(
         default="",
-        description="告急提醒与每日日报推送目标，如 qq:管理员QQ:private，留空只记日志",
-        json_schema_extra={"label": "推送目标", "placeholder": "qq:10000:private"},
+        description="余量告急提醒与每日消费日报的推送目标。格式：qq:QQ号:private（发私聊）或 qq:群号:group（发群）。留空则只记录日志",
+        json_schema_extra={
+            "label": "提醒推送目标",
+            "placeholder": "qq:10000:private",
+        },
     )
     daily_report_hour: int = Field(
         default=21,
         ge=0,
         le=23,
-        description="每天几点推送消费日报（0-23）",
-        json_schema_extra={"label": "日报推送时刻（点）"},
+        description="每天几点推送消费日报（0-23 点）",
+        json_schema_extra={"label": "每日日报推送时刻（点）"},
     )
 
 
+class PluginMetaSection(PluginConfigBase):
+    __ui_label__ = "插件基础"
+
+    config_version: str = Field(default="1.0.0", description="配置版本号（请勿修改）")
+    enabled: bool = Field(default=True, description="是否启用插件")
+
+
 class GovernorConfig(PluginConfigBase):
+    plugin: PluginMetaSection = Field(default_factory=PluginMetaSection)
     minimax_governor: GovernorSection = Field(default_factory=GovernorSection)
 
 
@@ -149,7 +168,12 @@ class MiniMaxGovernor(MaiBotPlugin):
         self.applied.clear()
 
     async def on_config_update(self, scope, config_data, version):
-        self.ctx.logger.info("管家: 配置已更新（version=%s），新设置即刻生效", version)
+        # WebUI 保存配置后，立即同步运行中的策略，无需重启
+        new_strategy = str(self._c("strategy", "balanced") or "balanced")
+        if new_strategy in STRATEGIES and new_strategy != self.strategy:
+            self.strategy = new_strategy
+            self._save_state()
+        self.ctx.logger.info("管家: 配置已更新（version=%s），当前策略=%s", version, self.strategy)
 
     # ---------- 配置读取 ----------
     def _c(self, key, default=None):
@@ -172,9 +196,9 @@ class MiniMaxGovernor(MaiBotPlugin):
         try:
             with open(self.state_file, "r", encoding="utf-8") as f:
                 state = json.load(f)
-            self.strategy = state.get("strategy", "balanced")
-            if self.strategy not in STRATEGIES:
-                self.strategy = "balanced"
+            s = state.get("strategy", "balanced")
+            if s in STRATEGIES:
+                self.strategy = s
         except Exception as e:
             self.ctx.logger.warning("管家状态读取失败: %s", e)
 
@@ -322,7 +346,7 @@ class MiniMaxGovernor(MaiBotPlugin):
 
     async def _gov_loop(self):
         await asyncio.sleep(60)
-        last_daily_check = None
+        last_report_date = None
         while True:
             try:
                 self._trim()
@@ -352,14 +376,12 @@ class MiniMaxGovernor(MaiBotPlugin):
 
                 # 每日消费日报
                 now = datetime.now()
-                report_hour = int(self._c("daily_report_hour", 21) or 21)
                 today = now.strftime("%Y-%m-%d")
-                if now.hour == report_hour and self.last_report_day != today:
-                    if last_daily_check != today:
-                        last_daily_check = today
-                        self.last_report_day = today
-                        self._trim()
-                        await self._alert(self._daily_report(len(self.replies)))
+                report_hour = int(self._c("daily_report_hour", 21) or 21)
+                if now.hour == report_hour and last_report_date != today:
+                    last_report_date = today
+                    self._trim()
+                    await self._alert(self._daily_report(len(self.replies)))
             except Exception as e:
                 self.ctx.logger.warning("管家调速循环异常: %s", e)
             await asyncio.sleep(60)
@@ -375,7 +397,6 @@ class MiniMaxGovernor(MaiBotPlugin):
             lines.append(f"· 消耗速度：{k} 每小时约 {rate:.1f}{eta_txt}")
         lines.append(f"· 最近 1 小时回复：{replies_last_hour} 条")
         lines.append(f"· 当前策略：{self.strategy}")
-        lines.append("· 小提示：改配置请到 WebUI 插件设置页～")
         return "\n".join(lines)
 
     async def _api_loop(self):
@@ -404,3 +425,7 @@ class MiniMaxGovernor(MaiBotPlugin):
             except Exception:
                 interval = 30
             await asyncio.sleep(interval * 60)
+
+
+def create_plugin():
+    return MiniMaxGovernor()
