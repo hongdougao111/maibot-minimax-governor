@@ -1,14 +1,15 @@
 import asyncio
 import json
 import os
+import re
 import time
 from collections import defaultdict, deque
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Dict
 
 import aiohttp
 
-from maibot_sdk import EventHandler, Field, MaiBotPlugin, PluginConfigBase
+from maibot_sdk import Command, EventHandler, Field, MaiBotPlugin, PluginConfigBase
 from maibot_sdk.types import EventType
 
 ENDPOINTS = [
@@ -63,6 +64,11 @@ class GovernorSection(PluginConfigBase):
             "hint": "在 MiniMax 开放平台「基本信息」页面查看",
         },
     )
+    admin_qq: str = Field(
+        default="",
+        description="管理员 QQ。/余额 与 /日报 命令仅限此 QQ 使用，多个用英文逗号分隔",
+        json_schema_extra={"label": "管理员 QQ", "placeholder": "10000"},
+    )
     check_interval_minutes: int = Field(
         default=30,
         ge=5,
@@ -109,6 +115,13 @@ class GovernorSection(PluginConfigBase):
         le=23,
         description="每天几点推送消费日报（0-23 点）",
         json_schema_extra={"label": "每日日报推送时刻（点）"},
+    )
+    daily_report_minute: int = Field(
+        default=0,
+        ge=0,
+        le=59,
+        description="日报推送的分钟数（0-59），配合上面的小时使用，如 21 点 30 分就填 30",
+        json_schema_extra={"label": "每日日报推送时刻（分）"},
     )
 
 
@@ -213,6 +226,40 @@ class MiniMaxGovernor(MaiBotPlugin):
         except Exception as e:
             self.ctx.logger.warning("管家状态保存失败: %s", e)
 
+    # ---------- 管理员鉴权（fail-closed：识别失败一律拒绝） ----------
+    def _admin_check(self, kwargs):
+        admins = str(self._c("admin_qq", "") or "")
+        if not admins:
+            self.ctx.logger.warning("管家: 未配置 admin_qq，管理员命令全部拒绝")
+            return False
+        admin_list = [a.strip() for a in admins.split(",") if a.strip()]
+        msg = kwargs.get("message")
+        uid = None
+        if isinstance(msg, dict):
+            # 按优先级尝试多个发送者字段路径（message_info.user_info.user_id 为 MaiBot 实际结构）
+            for path in (("user_info", "user_id"),
+                         ("message_info", "user_info", "user_id"),
+                         ("sender_id",)):
+                cur = msg
+                ok = True
+                for p in path:
+                    if isinstance(cur, dict) and p in cur:
+                        cur = cur[p]
+                    else:
+                        ok = False
+                        break
+                if ok and cur is not None:
+                    uid = cur
+                    break
+        if uid is None:
+            keys = list(msg.keys()) if isinstance(msg, dict) else type(msg).__name__
+            self.ctx.logger.info("管家: 未能识别命令发送者，消息顶层键=%s", keys)
+            return False
+        if str(uid) in admin_list:
+            return True
+        self.ctx.logger.info("管家: 命令发送者 uid=%s 不在管理员名单 %s 中", uid, admin_list)
+        return False
+
     # ---------- 消息处理 ----------
     def _extract_chat_id(self, message):
         if not isinstance(message, dict):
@@ -236,6 +283,55 @@ class MiniMaxGovernor(MaiBotPlugin):
         cutoff = time.time() - WINDOW
         while self.replies and self.replies[0][0] < cutoff:
             self.replies.popleft()
+
+    def _count_replies_from_log(self):
+        """从 bot.log 统计最近一小时的回复数。
+
+        MaiBot 1.3.x 的事件分发对 ON_MESSAGE/POST_SEND 处于注释状态，
+        第三方插件收不到事件，因此改用日志统计（每次回复都有一条
+        「回复器生成成功」日志）。
+        """
+        try:
+            if not self.state_file:
+                return 0
+            # bot.log 的位置因启动方式而异，逐个候选路径探测，取最近修改的那个
+            candidates = []
+            try:
+                data_dir = str(self.ctx.paths.data_dir)
+                candidates.append(os.path.join(os.path.dirname(data_dir), "bot.log"))
+                candidates.append(os.path.join(data_dir, "bot.log"))
+                candidates.append(os.path.join(os.path.dirname(os.path.dirname(data_dir)), "bot.log"))
+            except Exception:
+                pass
+            candidates.append("/root/maimai/bot.log")
+            candidates.append("/root/maimai/MaiBot/bot.log")
+            existing = [p for p in candidates if os.path.exists(p)]
+            if not existing:
+                self.ctx.logger.warning("管家: 找不到 bot.log，候选路径: %s", candidates)
+                return 0
+            log_path = max(existing, key=os.path.getmtime)
+            now = datetime.now()
+            size = os.path.getsize(log_path)
+            with open(log_path, "r", encoding="utf-8", errors="ignore") as f:
+                if size > 400000:
+                    f.seek(size - 400000)
+                    f.readline()  # 丢弃不完整的首行
+                lines = f.readlines()
+            count = 0
+            for line in lines:
+                if "回复器生成成功" not in line:
+                    continue
+                m = re.match(r"\s*(\d{2})-(\d{2}) (\d{2}):(\d{2}):(\d{2})", line)
+                if not m:
+                    continue
+                month, day, hh, mi, ss = (int(g) for g in m.groups())
+                ts = now.replace(month=month, day=day, hour=hh, minute=mi, second=ss)
+                if 0 <= (now - ts).total_seconds() <= WINDOW:
+                    count += 1
+            return count
+        except Exception as e:
+            self.ctx.logger.warning("管家: 日志统计回复数失败: %s", e)
+            return 0
 
     def _budget_for(self, chat_id):
         """分群独立预算：chat_id 里包含群号则用群号匹配，否则用默认。
@@ -361,39 +457,57 @@ class MiniMaxGovernor(MaiBotPlugin):
         last_report_date = None
         while True:
             try:
-                self._trim()
+                # 1. 从 bot.log 统计最近一小时的全局回复数（事件分发在该版本被注释，走日志兜底）
+                n_out = self._count_replies_from_log()
+
+                # 2. 获取所有群聊流，逐流决定是否限流
+                try:
+                    streams = await self.ctx.chat.get_group_streams() or []
+                except Exception as e:
+                    self.ctx.logger.warning("管家: 获取群聊流失败: %s", e)
+                    streams = []
+                if not isinstance(streams, list):
+                    streams = list(streams) if streams else []
+
                 hard_mult = float(self._c("hard_multiplier", 1.5) or 1.5)
                 preset = STRATEGIES.get(self.strategy, STRATEGIES["balanced"])
                 recover_ratio = preset["recover"]
                 throttle = preset["throttle"]
-                counts = defaultdict(int)
-                for _, cid in self.replies:
-                    counts[cid] += 1
                 low_pct = float(self._c("low_percent", 20) or 20)
                 percent_low = self.last_percent is not None and self.last_percent < low_pct
-                for cid in list(self.chat_ids):
-                    budget = self._budget_for(cid)
-                    hard = budget * hard_mult
-                    n = counts.get(cid, 0)
-                    if percent_low:
-                        await self._apply(cid, throttle, f"套餐余量仅 {self.last_percent}%")
-                    elif n >= hard:
-                        await self._apply(cid, throttle, f"回复 {n} 条 触及硬上限（预算{budget:.0f}）")
-                    elif n >= budget:
-                        ratio = (n - budget) / max(1.0, hard - budget)
-                        await self._apply(cid, throttle * (0.5 + 0.5 * ratio),
-                                          f"回复 {n} 条 超预算{budget:.0f}")
-                    elif n < budget * recover_ratio and self.applied.get(cid, 0) != 0:
-                        await self._apply(cid, 0.0, f"回复 {n} 条 回落至预算内")
 
-                # 每日消费日报
+                # 3. 全局回复数按群均摊后与各群预算比较
+                n_streams = max(1, len(streams))
+                per_stream = n_out / n_streams
+                for s in streams:
+                    if not isinstance(s, dict):
+                        continue
+                    sid = s.get("stream_id") or s.get("session_id")
+                    if not sid:
+                        continue
+                    gid = str(s.get("group_id") or "")
+                    budget = self._budget_for(gid)
+                    hard = budget * hard_mult
+                    if percent_low:
+                        await self._apply(sid, throttle, f"套餐余量仅 {self.last_percent}%")
+                    elif per_stream >= hard:
+                        await self._apply(sid, throttle, f"全局回复 {n_out} 条/时 触及硬上限")
+                    elif per_stream >= budget:
+                        ratio = (per_stream - budget) / max(1.0, hard - budget)
+                        await self._apply(sid, throttle * (0.5 + 0.5 * ratio),
+                                          f"全局回复 {n_out} 条/时 超预算{budget:.0f}")
+                    elif per_stream < budget * recover_ratio and self.applied.get(sid, 0) != 0:
+                        await self._apply(sid, 0.0, f"回复回落至预算内")
+
+                # 4. 每日消费日报（支持非整点，如 21:30）
                 now = datetime.now()
                 today = now.strftime("%Y-%m-%d")
                 report_hour = int(self._c("daily_report_hour", 21) or 21)
-                if now.hour == report_hour and last_report_date != today:
+                report_minute = int(self._c("daily_report_minute", 0) or 0)
+                target_time = now.replace(hour=report_hour, minute=report_minute, second=0, microsecond=0)
+                if now >= target_time and last_report_date != today:
                     last_report_date = today
-                    self._trim()
-                    await self._alert(self._daily_report(len(self.replies)))
+                    await self._alert(self._daily_report(n_out))
             except Exception as e:
                 self.ctx.logger.warning("管家调速循环异常: %s", e)
             await asyncio.sleep(60)
@@ -437,6 +551,46 @@ class MiniMaxGovernor(MaiBotPlugin):
             except Exception:
                 interval = 30
             await asyncio.sleep(interval * 60)
+
+    # ---------- 按需查询命令（随时可用） ----------
+    @Command("balance", pattern=r"^/余额$|^/balance$")
+    async def cmd_balance(self, **kwargs):
+        if not self._admin_check(kwargs):
+            await self.ctx.send.text("这个查询只有管理员能用哦～", kwargs["stream_id"])
+            return True, "denied", 2
+        data, err = await self.fetch_balance()
+        if err:
+            await self.ctx.send.text("MiniMax 查询失败：" + err, kwargs["stream_id"])
+            return True, err, 2
+        nums = self._record(data)
+        if not nums:
+            await self.ctx.send.text(
+                "【MiniMax 开支管家】\n"
+                "当前为 M Plan 订阅套餐，MiniMax 暂未开放余量查询接口，余量请到开放平台「套餐用量」页查看。\n"
+                f"调速按本地回复预算运行中：本小时回复 {self._count_replies_from_log()} 条（预算见设置页）。",
+                kwargs["stream_id"])
+            return True, "ok", 2
+        parts = ["【MiniMax 开支管家】"]
+        if self.last_percent is not None:
+            parts.append(f"套餐余量：{self.last_percent}%")
+        parts.append(self._fmt(nums))
+        est = self._burn_estimate()
+        if est:
+            k, rate, eta = est
+            eta_txt = f"，预计还能用 {eta:.1f} 天" if eta else ""
+            parts.append(f"消耗速度：{k} 每小时约 {rate:.1f}{eta_txt}")
+        self._trim()
+        parts.append(f"本小时回复：{len(self.replies)} 条")
+        await self.ctx.send.text("\n".join(parts), kwargs["stream_id"])
+        return True, "ok", 2
+
+    @Command("daily_report", pattern=r"^/日报$")
+    async def cmd_daily_report(self, **kwargs):
+        if not self._admin_check(kwargs):
+            await self.ctx.send.text("这个查询只有管理员能用哦～", kwargs["stream_id"])
+            return True, "denied", 2
+        await self.ctx.send.text(self._daily_report(self._count_replies_from_log()), kwargs["stream_id"])
+        return True, "ok", 2
 
 
 def create_plugin():
